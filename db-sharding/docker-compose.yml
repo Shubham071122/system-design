@@ -1,0 +1,162 @@
+services:
+  # ==========================================
+  # SHARD 1: Master (Writes) + Replica (Reads)
+  # ==========================================
+  shard1-master:
+    image: postgres:16-alpine
+    container_name: shard1-master
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app_db
+      REPL_USER: replicator
+      REPL_PASSWORD: replicator_password
+    volumes:
+      - ./scripts/init-master.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+    command:
+      [
+        "postgres",
+        "-c", "wal_level=replica",
+        "-c", "max_wal_senders=10",
+        "-c", "max_replication_slots=10",
+        "-c", "hot_standby=on"
+      ]
+    ports:
+      - "5431:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d app_db"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  shard1-replica:
+    image: postgres:16-alpine
+    container_name: shard1-replica
+    depends_on:
+      shard1-master:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app_db
+      REPL_USER: replicator
+      REPL_PASSWORD: replicator_password
+      MASTER_HOST: shard1-master
+    volumes:
+      - ./scripts/init-replica.sh:/entrypoint-replica.sh:ro
+    entrypoint: ["/entrypoint-replica.sh"]
+    ports:
+      - "5432:5432"
+
+  # ==========================================
+  # SHARD 2: Master (Writes) + Replica (Reads)
+  # ==========================================
+  shard2-master:
+    image: postgres:16-alpine
+    container_name: shard2-master
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app_db
+      REPL_USER: replicator
+      REPL_PASSWORD: replicator_password
+    volumes:
+      - ./scripts/init-master.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+    command:
+      [
+        "postgres",
+        "-c", "wal_level=replica",
+        "-c", "max_wal_senders=10",
+        "-c", "max_replication_slots=10",
+        "-c", "hot_standby=on"
+      ]
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d app_db"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  shard2-replica:
+    image: postgres:16-alpine
+    container_name: shard2-replica
+    depends_on:
+      shard2-master:
+        condition: service_healthy
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app_db
+      REPL_USER: replicator
+      REPL_PASSWORD: replicator_password
+      MASTER_HOST: shard2-master
+    volumes:
+      - ./scripts/init-replica.sh:/entrypoint-replica.sh:ro
+    entrypoint: ["/entrypoint-replica.sh"]
+    ports:
+      - "5434:5432"
+
+  # ==========================================
+  # 3 BACKEND INSTANCES (Single Go Backend Codebase)
+  # ==========================================
+  backend-1:
+    build: .
+    container_name: backend-1
+    environment: &backend-env
+      SERVER_NAME: backend-1
+      PORT: "8080"
+      SHARD1_MASTER_URL: "postgres://postgres:postgres@shard1-master:5432/app_db?sslmode=disable"
+      SHARD1_REPLICA_URL: "postgres://postgres:postgres@shard1-replica:5432/app_db?sslmode=disable"
+      SHARD2_MASTER_URL: "postgres://postgres:postgres@shard2-master:5432/app_db?sslmode=disable"
+      SHARD2_REPLICA_URL: "postgres://postgres:postgres@shard2-replica:5432/app_db?sslmode=disable"
+    ports:
+      - "8081:8080"
+    depends_on:
+      shard1-master:
+        condition: service_healthy
+      shard2-master:
+        condition: service_healthy
+
+  backend-2:
+    build: .
+    container_name: backend-2
+    environment:
+      <<: *backend-env
+      SERVER_NAME: backend-2
+    ports:
+      - "8082:8080"
+    depends_on:
+      shard1-master:
+        condition: service_healthy
+      shard2-master:
+        condition: service_healthy
+
+  backend-3:
+    build: .
+    container_name: backend-3
+    environment:
+      <<: *backend-env
+      SERVER_NAME: backend-3
+    ports:
+      - "8083:8080"
+    depends_on:
+      shard1-master:
+        condition: service_healthy
+      shard2-master:
+        condition: service_healthy
+
+  # ==========================================
+  # LOAD BALANCER (Nginx on Port 8080)
+  # ==========================================
+  load-balancer:
+    image: nginx:alpine
+    container_name: load-balancer
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend-1
+      - backend-2
+      - backend-3
